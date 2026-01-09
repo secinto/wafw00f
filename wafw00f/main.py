@@ -33,15 +33,52 @@ class WAFW00F(waftoolsengine):
     rcestring = r'/bin/cat /etc/passwd; ping 127.0.0.1; curl google.com'
     xxestring = r'<!ENTITY xxe SYSTEM "file:///etc/shadow">]><pwn>&hack;</pwn>'
 
+    # User-Agent strings for detection testing
+    ua_test_strings = {
+        # HTTP client libraries
+        'python_requests': 'python-requests/2.28.0',
+        'python_urllib': 'Python-urllib/3.9',
+        'go_http': 'Go-http-client/1.1',
+        'java_apache': 'Apache-HttpClient/4.5.13',
+        'java_default': 'Java/17.0.1',
+        'curl': 'curl/7.84.0',
+        'axios': 'axios/1.4.0',
+        'node_fetch': 'node-fetch/3.0',
+        'ruby': 'Ruby',
+        'faraday': 'Faraday v2.7.4',
+        # Security scanners
+        'nmap': 'Nmap Scripting Engine',
+        'sqlmap': 'sqlmap/1.6',
+        'nikto': 'nikto',
+        'wpscan': 'WPScan v3.8',
+        'acunetix': 'Acunetix-Product',
+        'nessus': 'Nessus SOAP',
+        # Known bots
+        'googlebot': 'Googlebot/2.1 (+http://www.google.com/bot.html)',
+        'bingbot': 'bingbot/2.0',
+        'ahrefsbot': 'AhrefsBot/7.0',
+        'semrushbot': 'SemrushBot/7',
+        # Malicious/suspicious patterns
+        'empty': '',
+        'dash': '-',
+        'garbage_xss': '<script>alert(1)</script>',
+        'garbage_sqli': "' OR '1'='1",
+    }
+
     def __init__(self, target='www.example.com', debuglevel=0, path='/',
-                 followredirect=True, extraheaders={}, proxies=None, timeout=7):
+                 followredirect=True, extraheaders={}, proxies=None, timeout=7, debug=False):
 
         self.log = logging.getLogger('wafw00f')
         self.attackres = None
-        waftoolsengine.__init__(self, target, debuglevel, path, proxies, followredirect, extraheaders, timeout)
+        waftoolsengine.__init__(self, target, debuglevel, path, proxies, followredirect, extraheaders, timeout, debug)
         self.knowledge = {
             'generic': {
                 'found': False,
+                'reason': ''
+            },
+            'useragent': {
+                'found': False,
+                'triggered': [],
                 'reason': ''
             },
             'wafname': []
@@ -50,6 +87,57 @@ class WAFW00F(waftoolsengine):
 
     def normalRequest(self):
         return self.Request()
+
+    def useragentDetect(self):
+        """
+        Test various User-Agent strings to detect if the target responds
+        differently based on the User-Agent header.
+        """
+        if self.rq is None:
+            return False
+
+        baseline_status = self.rq.status_code
+        baseline_length = len(self.rq.text)
+        triggered = []
+
+        for ua_name, ua_string in self.ua_test_strings.items():
+            try:
+                # Create headers with the test User-Agent
+                test_headers = self.headers.copy()
+                if ua_string:
+                    test_headers['User-Agent'] = ua_string
+                elif 'User-Agent' in test_headers:
+                    del test_headers['User-Agent']
+
+                resp = self.customRequest(headers=test_headers)
+                if resp is None:
+                    triggered.append((ua_string or '(empty)', 'Connection blocked'))
+                    continue
+
+                # Check for status code difference
+                if resp.status_code != baseline_status:
+                    triggered.append((ua_string or '(empty)',
+                        'Status %d (baseline: %d)' % (resp.status_code, baseline_status)))
+                    continue
+
+                # Check for significant body length difference (>20%)
+                resp_length = len(resp.text)
+                if baseline_length > 0:
+                    diff_pct = abs(resp_length - baseline_length) / baseline_length
+                    if diff_pct > 0.2:
+                        triggered.append((ua_string or '(empty)', 'Body size changed significantly'))
+
+            except Exception as e:
+                self.log.debug('UA test failed for %s: %s' % (ua_name, str(e)))
+                triggered.append((ua_string or '(empty)', 'Request failed'))
+
+        if triggered:
+            self.knowledge['useragent']['found'] = True
+            self.knowledge['useragent']['triggered'] = triggered
+            self.knowledge['useragent']['reason'] = 'The site responds differently to certain User-Agent headers'
+            return True
+
+        return False
 
     def customRequest(self, headers=None):
         return self.Request(
@@ -390,6 +478,8 @@ def main():
                       help='Set the timeout for the requests.')
     parser.add_option('--no-colors', dest='colors', action='store_false',
                       default=True, help='Disable ANSI colors in output.')
+    parser.add_option('-d', '--debug', dest='debug', action='store_true',
+                      default=False, help='Print HTTP requests and responses for debugging.')
 
     options, args = parser.parse_args()
 
@@ -485,10 +575,23 @@ def main():
             }
         attacker = WAFW00F(target, debuglevel=options.verbose, path=pret.path,
                     followredirect=options.followredirect, extraheaders=extraheaders,
-                        proxies=proxies, timeout=options.timeout)
+                        proxies=proxies, timeout=options.timeout, debug=options.debug)
         if attacker.rq is None:
             log.error('Site %s appears to be down' % pret.hostname)
             continue
+        # User-Agent based detection
+        print('[*] Checking for User-Agent based filtering...')
+        ua_detected = attacker.useragentDetect()
+        if ua_detected:
+            print('%s[+]%s User-Agent based filtering detected' % (G, E))
+            print('[*] These User-Agents are treated differently:')
+            for ua, reason in attacker.knowledge['useragent']['triggered']:
+                print('    - %s: %s' % (ua if ua else '(empty)', reason))
+            print('[~] Number of UA tests: %d, Triggered: %d' % (
+                len(attacker.ua_test_strings),
+                len(attacker.knowledge['useragent']['triggered'])))
+        else:
+            print('[-] No User-Agent based filtering detected')
         if options.test:
             if options.test in attacker.wafdetections:
                 waf = attacker.wafdetections[options.test](attacker)
@@ -508,10 +611,15 @@ def main():
         if (options.findall) or len(waf) == 0:
             print('[+] Generic Detection results:')
             generic_url = attacker.genericdetect()
-            if generic_url:
+            ua_found = attacker.knowledge['useragent']['found']
+            if generic_url or ua_found:
                 log.info('Generic Detection: %s' % attacker.knowledge['generic']['reason'])
                 print('[*] The site %s seems to be behind a WAF or some sort of security solution' % target)
-                print('[~] Reason: %s' % attacker.knowledge['generic']['reason'])
+                if attacker.knowledge['generic']['reason']:
+                    print('[~] Reason: %s' % attacker.knowledge['generic']['reason'])
+                if ua_found:
+                    print('[~] Reason: User-Agent based filtering detected (%d User-Agents blocked/filtered)' % (
+                        len(attacker.knowledge['useragent']['triggered'])))
                 results.append(buildResultRecord(target, 'generic', generic_url))
             else:
                 print('[-] No WAF detected by the generic detection')

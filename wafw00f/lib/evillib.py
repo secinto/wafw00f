@@ -32,7 +32,7 @@ proxies = {}
 class waftoolsengine:
     def __init__(
         self, target='https://example.com', debuglevel=0,
-        path='/', proxies=None, redir=True, head=None, timeout=7
+        path='/', proxies=None, redir=True, head=None, timeout=7, debug=False
     ):
         self.target = target
         self.debuglevel = debuglevel
@@ -43,6 +43,7 @@ class waftoolsengine:
         self.proxies = proxies
         self.log = logging.getLogger('wafw00f')
         self.timeout = timeout
+        self.debug = debug
         if head:
             self.headers = head
         else:
@@ -54,8 +55,34 @@ class waftoolsengine:
             if not headers:
                 h = self.headers
             else: h = headers
+
+            if self.debug:
+                print('\n' + '=' * 60)
+                print('>>> REQUEST #%d' % (self.requestnumber + 1))
+                print('=' * 60)
+                print('URL: %s' % self.target)
+                print('Method: GET')
+                if params:
+                    print('Params: %s' % params)
+                print('Headers:')
+                for key, val in h.items():
+                    print('  %s: %s' % (key, val))
+
             req = requests.get(self.target, proxies=self.proxies, headers=h, timeout=self.timeout,
                     allow_redirects=self.allowredir, params=params, verify=False)
+
+            if self.debug:
+                print('\n' + '-' * 60)
+                print('<<< RESPONSE')
+                print('-' * 60)
+                print('Status: %d %s' % (req.status_code, req.reason))
+                print('Headers:')
+                for key, val in req.headers.items():
+                    print('  %s: %s' % (key, val))
+                print('Body (first 500 chars):')
+                print(req.text[:500] if len(req.text) > 500 else req.text)
+                print('=' * 60 + '\n')
+
             self.log.info('Request Succeeded')
             self.log.debug('Headers: %s\n' % req.headers)
             self.log.debug('Content: %s\n' % req.content)
